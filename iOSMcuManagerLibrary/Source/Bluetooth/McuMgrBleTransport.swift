@@ -233,7 +233,6 @@ extension McuMgrBleTransport: McuMgrTransport {
         }
         
         didDisconnect()
-        softReset()
         if let modePeripheral = modeParameter as? CBPeripheral {
             modePeripherals[newMode] = modePeripheral
         }
@@ -347,7 +346,16 @@ extension McuMgrBleTransport: McuMgrTransport {
      prevent issues and attempt to improve reliability, it's better to wipe any lingering state.
      */
     internal func softReset() {
+        #if DEBUG
+        log(msg: #function, atLevel: .debug)
+        #endif
         previousUpdateNotificationSequenceNumber = nil
+        // Disable parallel writes unless specifically re-enabled by an upper layer.
+        // This fixes mismatches between different connections when reusing the transport.
+        numberOfParallelWrites = 1
+        // Disable Reassembly. New connection can renable if available.
+        chunkSendDataToMtuSize = false
+        // Clear write buffers.
         writeState = McuMgrBleTransportWriteState()
         robWriteBuffer = McuMgrBleROBWriteBuffer(logDelegate)
     }
@@ -357,6 +365,7 @@ extension McuMgrBleTransport: McuMgrTransport {
         smpCharacteristic = nil
         connectionLock.open(McuMgrTransportError.disconnected)
         state = .disconnected
+        softReset()
     }
     
     /// This method sends the data to the target. Before, it ensures that
