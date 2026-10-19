@@ -38,19 +38,19 @@ extension DeviceStatusManager {
     // MARK: requestStatusInfo
     
     func requestStatusInfo() async -> DeviceStatusInfo {
-        async let mcuMgrParametersResponse = defaultManager.params()
-        async let appInfoResponse = defaultManager.applicationInfo(format: [.kernelName, .kernelVersion])
-        async let bootloaderInfo = defaultManager.bootloaderInfo()
+        let mcuMgrParametersResponse = try? await defaultManager.params()
+        let appInfoResponse = try? await defaultManager.applicationInfo(format: [.kernelName, .kernelVersion])
+        let bootloaderInfo = try? await defaultManager.bootloaderInfo()
         
         var info = DeviceStatusInfo()
-        if let mcuMgrParams = try? await mcuMgrParametersResponse {
-            info.bufferSize = mcuMgrParams.bufferSize
-            info.bufferCount = mcuMgrParams.bufferCount
+        if let mcuMgrParametersResponse {
+            info.bufferSize = mcuMgrParametersResponse.bufferSize
+            info.bufferCount = mcuMgrParametersResponse.bufferCount
         }
-        info.appInfoOutput = (try? await appInfoResponse)?.response
-        info.bootloader = try? await bootloaderInfo.bootloader
-        info.bootloaderMode = try? await bootloaderInfo.mode
-        info.bootloaderSlot = try? await bootloaderInfo.slot
+        info.appInfoOutput = appInfoResponse?.response
+        info.bootloader = bootloaderInfo?.bootloader
+        info.bootloaderMode = bootloaderInfo?.mode
+        info.bootloaderSlot = bootloaderInfo?.slot
         return info
     }
     
