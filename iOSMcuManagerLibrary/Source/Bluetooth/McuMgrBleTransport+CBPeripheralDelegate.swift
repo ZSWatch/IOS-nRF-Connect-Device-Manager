@@ -100,7 +100,6 @@ extension McuMgrBleTransport: CBPeripheralDelegate {
         // Set the SMP characteristic.
         smpCharacteristic = characteristic
         state = .connected
-        softReset()
         notifyStateChanged(.connected)
         
         // The SMP Service and characteristic have now been discovered and set
