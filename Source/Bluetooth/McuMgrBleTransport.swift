@@ -41,6 +41,10 @@ public class McuMgrBleTransport: NSObject {
     /// The CBCentralManager instance from which the peripheral was obtained.
     /// This is used to connect and cancel connection.
     internal let centralManager: CBCentralManager
+    // A retrieved peripheral can be connected by another central/system client.
+    // Its global state is not proof that this SDK central owns a connection.
+    internal var connectedLocally = false
+    internal let lifetime = McuMgrBleLifetime()
     /// The queue used to buffer requests when another one is in progress.
     private let operationQueue: OperationQueue
     /// Lock used to wait for callbacks before continuing the request. This lock
@@ -52,7 +56,7 @@ public class McuMgrBleTransport: NSObject {
     /// Used to track the Sequence Number the chunked responses belong to.
     internal var previousUpdateNotificationSequenceNumber: McuSequenceNumber?
     
-    internal lazy var robWriteBuffer = McuMgrBleROBWriteBuffer(logDelegate)
+    internal lazy var robWriteBuffer = McuMgrBleROBWriteBuffer(logDelegate, lifetime: lifetime)
     
     internal let configuration: McuMgrBleTransport.Configuration
     
@@ -77,7 +81,9 @@ public class McuMgrBleTransport: NSObject {
         }
     }
     /// The log delegate will receive transport logs.
-    public weak var logDelegate: McuMgrLogDelegate?
+    public weak var logDelegate: McuMgrLogDelegate? {
+        didSet { robWriteBuffer.setLogDelegate(logDelegate) }
+    }
     
     /// Set to values larger than 1 to enable Parallel Writes
     ///
@@ -102,6 +108,9 @@ public class McuMgrBleTransport: NSObject {
     /// to MTU Size so as to keep within each transmission packet's maximum (MTU) size limit. Otherwise, it's
     /// likely that CoreBluetooth will not send the Data.
     public var chunkSendDataToMtuSize: Bool = false
+    /// Preserve upstream retry behavior by default. Owners issuing non-idempotent
+    /// commands may disable replay when a fully admitted request has no response.
+    public var retryOnMissingResponse: Bool = true
     
     public internal(set) var state: PeripheralState = .disconnected {
         didSet {
@@ -149,7 +158,10 @@ public class McuMgrBleTransport: NSObject {
     /// - parameter uuidConfig: A custom UUID configuration
     public convenience init(_ targetIdentifier: UUID, _ configuration: Configuration? = nil) {
         let centralManager = CBCentralManager(delegate: nil, queue: .global(qos: .userInitiated))
-        let peripheral = centralManager.retrievePeripherals(withIdentifiers: [targetIdentifier]).first //can return nil oddly enough
+        // CoreBluetooth retrieval is valid only after poweredOn. The delegate
+        // retrieves by identifier when this new manager becomes ready.
+        let peripheral = centralManager.state == .poweredOn
+            ? centralManager.retrievePeripherals(withIdentifiers: [targetIdentifier]).first : nil
 
         self.init(peripheral, targetIdentifier, centralManager,
                   configuration ?? DefaultTransportConfiguration())
@@ -209,6 +221,10 @@ extension McuMgrBleTransport: McuMgrTransport {
     public func send<T: McuMgrResponse>(data: Data, timeout: Int, callback: @escaping McuMgrCallback<T>) {
         operationQueue.addOperation {
             for i in 0..<McuMgrBleTransportConstant.MAX_RETRIES {
+                guard !self.lifetime.isInvalidated else {
+                    DispatchQueue.main.async { callback(nil, McuMgrTransportError.disconnected) }
+                    return
+                }
                 switch self._send(data: data, timeoutInSeconds: timeout) {
                 case .failure(McuMgrTransportError.waitAndRetry):
                     let waitInterval = min(timeout, McuMgrBleTransportConstant.WAIT_AND_RETRY_INTERVAL)
@@ -257,6 +273,17 @@ extension McuMgrBleTransport: McuMgrTransport {
         callback(.deferred)
     }
     
+    /// Permanently invalidate an app-owned session, including queued writes.
+    /// Unlike close(), this instance cannot reconnect or be reused for DFU.
+    public func invalidate() {
+        lifetime.invalidate()
+        operationQueue.cancelAllOperations()
+        robWriteBuffer.clear(McuMgrTransportError.disconnected)
+        connectionLock.open(McuMgrTransportError.disconnected)
+        writeState.onError(McuMgrTransportError.disconnected)
+        close()
+    }
+
     public func close() {
         if let peripheral, peripheral.state == .connected || peripheral.state == .connecting {
             log(msg: "Cancelling connection...", atLevel: .verbose)
@@ -293,7 +320,7 @@ extension McuMgrBleTransport: McuMgrTransport {
     internal func softReset() {
         previousUpdateNotificationSequenceNumber = nil
         writeState = McuMgrBleTransportWriteState()
-        robWriteBuffer = McuMgrBleROBWriteBuffer(logDelegate)
+        robWriteBuffer = McuMgrBleROBWriteBuffer(logDelegate, lifetime: lifetime)
     }
     
     /// This method sends the data to the target. Before, it ensures that
@@ -339,15 +366,18 @@ extension McuMgrBleTransport: McuMgrTransport {
             
             switch targetPeripheral.state {
             case .connected:
-                // If the peripheral was already connected, but the SMP
-                // characteristic has not been set, start by performing service
-                // discovery. Once the characteristic's notification is enabled,
-                // the semaphore will be signaled and the request can be sent.
-                log(msg: "Peripheral already connected", atLevel: .info)
-                log(msg: "Discovering services...", atLevel: .verbose)
                 state = .connecting
-                targetPeripheral.delegate = self
-                targetPeripheral.discoverServices([configuration.characteristicUUUID])
+                guard lifetime.perform({
+                    if connectedLocally {
+                        targetPeripheral.delegate = self
+                        targetPeripheral.discoverServices([configuration.serviceUUID])
+                    } else {
+                        // Register this central before the companion releases
+                        // its connection or the application enters background.
+                        // didConnect performs discovery and notification setup.
+                        centralManager.connect(targetPeripheral)
+                    }
+                }) else { return .failure(McuMgrTransportError.disconnected) }
             case .disconnected:
                 // If the peripheral is disconnected, begin the setup process by
                 // connecting to the device. Once the characteristic's
@@ -355,11 +385,17 @@ extension McuMgrBleTransport: McuMgrTransport {
                 // the request can be sent.
                 log(msg: "Connecting...", atLevel: .verbose)
                 state = .connecting
-                centralManager.connect(targetPeripheral)
+                guard lifetime.perform({ centralManager.connect(targetPeripheral) }) else {
+                    return .failure(McuMgrTransportError.disconnected)
+                }
             case .connecting:
                 log(msg: "Device is connecting...", atLevel: .info)
                 state = .connecting
-                // Do nothing. It will switch to .connected or .disconnected.
+                // This may be another client's pending connection. Register
+                // ours too so that our didConnect callback performs setup.
+                guard lifetime.perform({ centralManager.connect(targetPeripheral) }) else {
+                    return .failure(McuMgrTransportError.disconnected)
+                }
             case .disconnecting:
                 log(msg: "Device is disconnecting...", atLevel: .info)
                 // If the peripheral's connection state is transitioning, wait and retry
@@ -380,6 +416,7 @@ extension McuMgrBleTransport: McuMgrTransport {
             }
         }
         
+        guard !lifetime.isInvalidated else { return .failure(McuMgrTransportError.disconnected) }
         assert(connectionLock.isOpen)
         
         // Make sure the SMP characteristic is not nil.
@@ -464,8 +501,9 @@ extension McuMgrBleTransport: McuMgrTransport {
                 writeLock.open(McuMgrTransportError.peripheralNotReadyForWriteWithoutResponse)
                 return .failure(McuMgrTransportError.peripheralNotReadyForWriteWithoutResponse)
             }
-            writeLock.open(McuMgrTransportError.waitAndRetry)
-            return .failure(McuMgrTransportError.waitAndRetry)
+            let error: McuMgrTransportError = retryOnMissingResponse ? .waitAndRetry : .sendTimeout
+            writeLock.open(error)
+            return .failure(error)
         case .failure(let error):
             writeLock.open(error)
             return .failure(error)

@@ -326,9 +326,16 @@ public class McuMgrExecResponse: McuMgrResponse {
     
     /// Command output.
     public var output: String?
+    /// Zephyr shell's signed command return value, distinct from SMP rc.
+    public var returnCode: Int64?
     
     public required init(cbor: CBOR?) throws {
         try super.init(cbor: cbor)
+        if case let CBOR.unsignedInt(value)? = cbor?["ret"], value <= UInt64(Int64.max) {
+            returnCode = Int64(value)
+        } else if case let CBOR.negativeInt(value)? = cbor?["ret"], value <= UInt64(Int64.max) {
+            returnCode = -Int64(value) - 1
+        }
         if case let CBOR.utf8String(output)? = cbor?["o"] {
             self.output = output
         }

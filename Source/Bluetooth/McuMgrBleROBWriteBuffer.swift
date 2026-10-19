@@ -21,18 +21,11 @@ import CoreBluetooth
  */
 internal final class McuMgrBleROBWriteBuffer {
     
-    /**
-     The minimum amount of time we expect needs to elapse before the Write Without Response buffer is cleared in miliseconds.
-
-     The minimum connection interval time is 15 ms, as noted in this technical document: `https://developer.apple.com/library/archive/qa/qa1931/_index.html`. Therefore, it is reasonable to assume that past this interval, the BLE Radio will be powered up by the CoreBluetooth API / Subsystem to send the write values we've enqueued onto the CBPeripheral.
-     */
-    internal static let CONNECTION_BUFFER_WAIT_TIME_MS = 15
-    
     // MARK: - Private Properties
     
+    private let lifetime: McuMgrBleLifetime
     private let lock = DispatchQueue(label: "McuMgrBleROBWriteBuffer", qos: .userInitiated)
     
-    private var overridePeripheralNotReadyForWriteWithoutResponse: Bool
     private var pausedWritesWithoutResponse: Bool
     private var window: [Write]
     private var writeNumber: Int
@@ -46,16 +39,19 @@ internal final class McuMgrBleROBWriteBuffer {
     
     // MARK: init
     
-    init(_ log: McuMgrLogDelegate?) {
+    init(_ log: McuMgrLogDelegate?, lifetime: McuMgrBleLifetime) {
+        self.lifetime = lifetime
         self.log = log
-        // Override for first packet we try to send.
-        self.overridePeripheralNotReadyForWriteWithoutResponse = true
         self.pausedWritesWithoutResponse = false
         self.window = [Write]()
         self.writeNumber = 0
     }
     
     // MARK: API
+
+    internal func setLogDelegate(_ delegate: McuMgrLogDelegate?) {
+        lock.sync { log = delegate }
+    }
     
     internal func isInFlight(_ sequenceNumber: McuSequenceNumber) -> Bool {
         lock.sync { [unowned self] in
@@ -69,33 +65,32 @@ internal final class McuMgrBleROBWriteBuffer {
      All chunks of the same packet need to be sent together. Otherwise, they can't be merged properly on the receiving end.
      */
     internal func enqueue(_ sequenceNumber: McuSequenceNumber, data: [Data], to peripheral: CBPeripheral, characteristic: CBCharacteristic, callback: @escaping (Data?, McuMgrTransportError?) -> Void) {
-        // Do not enqueue again if said sequence number is in-flight.
-        guard !isInFlight(sequenceNumber) else {
-            guard pausedWritesWithoutResponse else { return }
-            // Note that sometimes we will not get a "peripheralIsReadyForWriteWithoutResponse".
-            // The only way to move forward, is just to ask / try again to send.
-            pausedWritesWithoutResponse = false
-            let targetSequenceNumber: McuSequenceNumber! = window.first?.mcuMgrSequenceNumber
-            log(msg: "→ Continue [Seq. No: \(targetSequenceNumber)].", atLevel: .debug)
-            unsafe_writeThroughWindow(to: peripheral)
-            return
-        }
-        
-        // This lock guarantees parallel writes are not interleaved with each other.
-        lock.async { [unowned self] in
+        lock.async { [weak self] in
+            guard let self else { return }
+            guard !lifetime.isInvalidated else { callback(nil, .disconnected); return }
+            if window.contains(where: { $0.mcuMgrSequenceNumber == sequenceNumber }) {
+                if pausedWritesWithoutResponse { unsafe_writeThroughWindow(to: peripheral) }
+                return
+            }
             window.append(contentsOf: Write.split(writeNumber, sequenceNumber: sequenceNumber, chunks: data, peripheral: peripheral, characteristic: characteristic, callback: callback))
             window.sort(by: <)
-            #if DEBUG
-            log(msg: "↵ Enqueued [Seq. No: \(sequenceNumber)] {WR \(writeNumber)}.", atLevel: .debug)
-            #endif
             writeNumber = writeNumber == .max ? 0 : writeNumber + 1
-            
             unsafe_writeThroughWindow(to: peripheral)
         }
     }
-    
+
+    internal func clear(_ error: McuMgrTransportError) {
+        lock.sync {
+            let pending = window
+            window.removeAll()
+            pausedWritesWithoutResponse = false
+            for write in pending { write.callback(nil, error) }
+        }
+    }
+
     internal func peripheralReadyToWrite(_ peripheral: CBPeripheral) {
-        lock.async { [unowned self] in
+        lock.async { [weak self] in
+            guard let self else { return }
             // Note: peripheralIsReady(toSendWriteWithoutResponse:) is called many times.
             // We only want to continue past this guard when a write was paused and
             // thus added to `pausedWrites`.
@@ -117,20 +112,16 @@ private extension McuMgrBleROBWriteBuffer {
     
     func unsafe_writeThroughWindow(to peripheral: CBPeripheral) {
         while let write = window.first {
-            guard overridePeripheralNotReadyForWriteWithoutResponse || peripheral.canSendWriteWithoutResponse else {
-                pausedWritesWithoutResponse = true
-                unsafe_logPause(write)
-                // If after 15ms we have not received peripheralIsReady(), override.
-                lock.asyncAfter(deadline: .now() + .milliseconds(Self.CONNECTION_BUFFER_WAIT_TIME_MS)) { [weak self] in
-                    guard let self, pausedWritesWithoutResponse else { return }
-                    log(msg: "! Override Peripheral Ready For Write Without Response", atLevel: .debug)
-                    overridePeripheralNotReadyForWriteWithoutResponse = true
-                    unsafe_writeThroughWindow(to: peripheral)
-                }
+            guard !lifetime.isInvalidated else {
+                let pending = window; window.removeAll()
+                for write in pending { write.callback(nil, .disconnected) }
                 return
             }
-            
-            overridePeripheralNotReadyForWriteWithoutResponse = false
+            guard peripheral.canSendWriteWithoutResponse else {
+                pausedWritesWithoutResponse = true
+                unsafe_logPause(write)
+                return
+            }
             
             // Clear state of pausedWritesWithoutResponse in case we end up here, and thus empty
             // the window (queue), before peripheralReadyToWrite()'s code runs.
@@ -139,9 +130,10 @@ private extension McuMgrBleROBWriteBuffer {
                 unsafe_logResume(write)
             }
             
-            peripheral.writeValue(write.chunk, for: write.characteristic,
-                                  type: .withoutResponse)
-            write.callback(write.chunk, nil)
+            let admitted = lifetime.perform {
+                peripheral.writeValue(write.chunk, for: write.characteristic, type: .withoutResponse)
+            }
+            write.callback(admitted ? write.chunk : nil, admitted ? nil : .disconnected)
             // ↓ Paranoia, I agree. But it makes me feel safe.
             assert(window[0] == write)
             window.remove(at: 0)

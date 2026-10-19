@@ -13,6 +13,10 @@ import CoreBluetooth
 extension McuMgrBleTransport: CBCentralManagerDelegate {
     
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        guard !lifetime.isInvalidated else {
+            connectionLock.open(McuMgrTransportError.disconnected)
+            return
+        }
         switch central.state {
         case .poweredOn:
             if let peripheral = centralManager
@@ -31,18 +35,26 @@ extension McuMgrBleTransport: CBCentralManagerDelegate {
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         guard self.identifier == peripheral.identifier else { return }
         
+        guard !lifetime.isInvalidated else {
+            central.cancelPeripheralConnection(peripheral)
+            return
+        }
+        connectedLocally = true
         log(msg: "Peripheral connected", atLevel: .info)
         state = .initializing
         previousUpdateNotificationSequenceNumber = nil
         log(msg: "Discovering services...", atLevel: .verbose)
-        peripheral.delegate = self
-        peripheral.discoverServices([configuration.serviceUUID])
+        if !lifetime.perform({
+            peripheral.delegate = self
+            peripheral.discoverServices([configuration.serviceUUID])
+        }) { central.cancelPeripheralConnection(peripheral) }
     }
     
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         guard self.identifier == peripheral.identifier else {
             return
         }
+        connectedLocally = false
         log(msg: "Peripheral disconnected", atLevel: .info)
         peripheral.delegate = nil
         smpCharacteristic = nil
@@ -55,6 +67,7 @@ extension McuMgrBleTransport: CBCentralManagerDelegate {
         guard self.identifier == peripheral.identifier else {
             return
         }
+        connectedLocally = false
         log(msg: "Peripheral failed to connect", atLevel: .warning)
         connectionLock.open(McuMgrTransportError.connectionFailed)
     }
